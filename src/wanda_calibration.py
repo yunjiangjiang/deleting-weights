@@ -2,8 +2,8 @@
 
 compute_wanda_scores scores every weight of the target linear layers as |W_ij| * a_j (Sun et al., 2023,
 arXiv:2306.11695), where a_j sums the L2 norm of the inputs to column j over the calibration batches.
-wanda_prior_deletions marks the lowest-scoring fraction of weights, and apply_wanda_prior shifts the mask logits so
-those weights start deleted.
+wanda_prior_deletions marks the lowest-scoring fraction of weights (below wanda_threshold), and apply_wanda_prior
+shifts the mask logits so those weights start deleted.
 """
 
 from typing import Iterable
@@ -11,7 +11,10 @@ from typing import Iterable
 import torch
 import torch.nn as nn
 
+from learnable_sparsity.lora_delete_linear import LoRADeleteSparseLinear
 from learnable_sparsity.sparse_linear import SparseLinear
+
+_MASKED_LAYERS = (SparseLinear, LoRADeleteSparseLinear)
 
 
 def compute_wanda_scores(
@@ -20,20 +23,22 @@ def compute_wanda_scores(
     device: torch.device,
     num_samples: int,
     target_modules: list[str],
-) -> dict[str, torch.Tensor]:
+    return_activation_norms: bool = False,
+) -> dict[str, torch.Tensor] | tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     """Return ``{module_name: [out_features, in_features] Wanda scores}`` for every target linear layer.
 
     A target is a layer whose name contains one of ``target_modules``. The dataloader yields dicts with ``input_ids``
     and ``attention_mask`` until ``num_samples`` examples are seen. Masked layers run their unmasked weights here.
+    With ``return_activation_norms``, also return ``{module_name: [in_features] a}``, the column norms a_j.
     """
     model.eval()
-    sparse_layers = [m for m in model.modules() if isinstance(m, SparseLinear)]
+    sparse_layers = [m for m in model.modules() if isinstance(m, _MASKED_LAYERS)]
     for m in sparse_layers:
         m.sparse = False
     activation_norms: dict[str, torch.Tensor] = {}
     hooks = []
     for name, module in model.named_modules():
-        if isinstance(module, (nn.Linear, SparseLinear)) and any(t in name for t in target_modules):
+        if isinstance(module, (nn.Linear, *_MASKED_LAYERS)) and any(t in name for t in target_modules):
             def _hook(mod, inp, _out, name=name):
                 """Add this batch's per-column input norm to the running total."""
                 # [B, seq_len, in_features], or [routed tokens, in_features] for a mixture-of-experts expert.
@@ -61,10 +66,17 @@ def compute_wanda_scores(
 
     scores: dict[str, torch.Tensor] = {}
     for name, module in model.named_modules():
-        if isinstance(module, (nn.Linear, SparseLinear)) and name in activation_norms:
+        if isinstance(module, (nn.Linear, *_MASKED_LAYERS)) and name in activation_norms:
             W = module.weight.data.float().abs()  # [out, in]
             scores[name] = W * activation_norms[name].unsqueeze(0)
-    return scores
+    return (scores, activation_norms) if return_activation_norms else scores
+
+
+def wanda_threshold(scores: torch.Tensor, init_sparsity: float) -> float:
+    """Return the k-th smallest score, k = max(1, int(numel * init_sparsity)); scores below it are deleted."""
+    flat_scores = scores.view(-1)
+    k_prune = max(1, int(flat_scores.numel() * init_sparsity))
+    return flat_scores.kthvalue(k_prune).values.item()
 
 
 def wanda_prior_deletions(
@@ -79,9 +91,7 @@ def wanda_prior_deletions(
         if not isinstance(module, SparseLinear) or name not in wanda_scores:
             continue
         flat_scores = wanda_scores[name].to(module.weight.device).view(-1)  # [out * in]
-        k_prune = max(1, int(flat_scores.numel() * init_sparsity))
-        threshold = flat_scores.kthvalue(k_prune).values.item()
-        deletions[name] = flat_scores < threshold
+        deletions[name] = flat_scores < wanda_threshold(scores=flat_scores, init_sparsity=init_sparsity)
     return deletions
 
 

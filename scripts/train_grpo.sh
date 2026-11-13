@@ -75,6 +75,8 @@ esac
 
 case "${METHOD:-deletion_tuning}" in
   deletion_tuning) ;;
+  lora_delete)
+    ARGS+=(actor_rollout_ref.model.mask_type=lora_delete actor_rollout_ref.model.mask_rank="${MASK_RANK:-32}") ;;
   fft)
     ARGS+=(actor_rollout_ref.model.deletion_tuning=false actor_rollout_ref.rollout.load_format=safetensors
            "actor_rollout_ref.actor.checkpoint.save_contents=[hf_model]")

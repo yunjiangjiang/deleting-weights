@@ -155,6 +155,9 @@ class HFModelConfig(BaseConfig):
     mask_calib_parquet_files: Optional[list[str]] = None
     mask_calib_num_samples: int = 2048
     mask_calib_max_prompt_length: int = 512
+    mask_type: str = "dense"
+    mask_rank: int = 32
+    mask_init_std: float = 0.01
 
     def __post_init__(self):
         import_external_libs(self.external_lib)

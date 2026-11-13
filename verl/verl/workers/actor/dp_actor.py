@@ -566,7 +566,6 @@ class DataParallelPPOActor(BasePPOActor):
         deletion_tuning = hasattr(self.actor_module, "mask_weight_reg")
         if deletion_tuning:
             import verl_adapters
-            from learnable_sparsity import sparse_linear
 
             verl_adapters.set_mask_schedule(
                 model=self.actor_module,
@@ -613,7 +612,7 @@ class DataParallelPPOActor(BasePPOActor):
                         loss_scale_factor = 1 / self.gradient_accumulation
 
                     if deletion_tuning:
-                        sparse_linear.open_sparse_weight_norm_window()
+                        verl_adapters.open_micro_batch(model=self.actor_module, loss_scale_factor=loss_scale_factor)
                     # all return: (bsz, response_length)
                     outputs = self._forward_micro_batch(
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
@@ -706,6 +705,6 @@ class DataParallelPPOActor(BasePPOActor):
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
                 if deletion_tuning:
-                    sparse_linear.step_all_sparse_modules(model=self.actor_module)
+                    verl_adapters.step_mask_schedules(model=self.actor_module)
         self.actor_optimizer.zero_grad()
         return metrics
