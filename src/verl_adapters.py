@@ -76,6 +76,10 @@ def apply_deletion_tuning(model: nn.Module, model_config: DictConfig) -> nn.Modu
         wanda_scores = _wanda_scores(model=model, model_config=model_config)
 
     sharpness = [model_config.mask_sharpness_start, model_config.mask_sharpness_end]
+    # Optional run-level seed for the gate noise init; unset keeps the paper's default behavior.
+    seed_env = os.environ.get("MASK_INIT_SEED")
+    if seed_env is not None:
+        torch.manual_seed(int(seed_env))
     # set_mask_schedule sets the schedule length from the trainer's step count.
     sparse_linear.convert_to_sparse_model(
         model=model, target_modules=list(model_config.mask_target_modules), sharpness=sharpness, total_steps=1,
