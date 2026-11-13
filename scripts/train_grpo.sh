@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # GRPO with Deletion Tuning, one run per call, with the paper's settings for each model.
 #
-# Usage: [METHOD=fft] bash scripts/train_grpo.sh <model> <output_dir> [extra Hydra overrides ...]
+# Usage: [METHOD=fft|lora|mth] bash scripts/train_grpo.sh <model> <output_dir> [extra Hydra overrides ...]
 #   model: llama1b | llama3b | llama8b (GSM8K) or qwen0.5b | qwen3b | qwen7b | qwen14b | qwen30b_a3b (SimpleRL-Zoo)
 # qwen14b runs on 2 nodes and qwen30b_a3b on 8 nodes of 8 GPUs, all in one Ray cluster.
 # Masks are saved to <output_dir>/global_step_N/mask/ at every validation step, and <output_dir>/metrics.jsonl
 # logs every step (src/summarize_grpo.py prints the best validation).
 # METHOD=fft trains the full fine-tuning baseline instead and saves the model at the same steps to
 # <output_dir>/global_step_N/actor/huggingface/.
+# METHOD=lora trains the LoRA baseline on all seven projections (verl's PEFT LoRA, rank LORA_RANK, default 4, lr 1e-4)
+# and saves the adapter to <output_dir>/global_step_N/actor/lora_adapter/.
+# METHOD=mth trains the random sparse fine-tuning baseline (src/random_sparse_ft.py): a fixed random fraction
+# MTH_DENSITY (default 0.01, lr 1e-4; 0.0005 uses lr 1e-3) of every parameter, saved like fft.
 # Run from the repository root after scripts/prepare_grpo_data.sh.
 set -euo pipefail
 MODEL=$1; OUT=$2; shift 2
@@ -87,7 +91,25 @@ case "${METHOD:-deletion_tuning}" in
              actor_rollout_ref.actor.fsdp_config.optimizer_offload=true
              actor_rollout_ref.actor.strategy=fsdp)
     fi ;;
-  *) echo "METHOD must be deletion_tuning or fft" >&2; exit 1 ;;
+  lora)
+    ARGS+=(actor_rollout_ref.model.deletion_tuning=false actor_rollout_ref.model.lora_rank="${LORA_RANK:-4}"
+           "actor_rollout_ref.model.target_modules=[q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj]"
+           actor_rollout_ref.actor.optim.lr=1e-4
+           actor_rollout_ref.rollout.load_format=safetensors actor_rollout_ref.rollout.layered_summon=true
+           "actor_rollout_ref.actor.checkpoint.save_contents=[extra]") ;;
+  mth)
+    MTH_DENSITY=${MTH_DENSITY:-0.01}
+    case "$MTH_DENSITY" in
+      0.01) MTH_LR=1e-4 ;;
+      0.0005) MTH_LR=1e-3 ;;
+      *) echo "MTH_DENSITY must be 0.01 or 0.0005 (the paper's settings)" >&2; exit 1 ;;
+    esac
+    # Weight decay 0, so the entries outside the random subset never move.
+    ARGS+=(actor_rollout_ref.model.deletion_tuning=false actor_rollout_ref.model.mth_density="$MTH_DENSITY"
+           actor_rollout_ref.actor.optim.lr=$MTH_LR actor_rollout_ref.actor.optim.weight_decay=0
+           actor_rollout_ref.rollout.load_format=safetensors
+           "actor_rollout_ref.actor.checkpoint.save_contents=[hf_model]") ;;
+  *) echo "METHOD must be deletion_tuning, fft, lora or mth" >&2; exit 1 ;;
 esac
 
 # Optional env override for the HF model path (e.g. ungated mirrors when no HF token).

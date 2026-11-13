@@ -405,6 +405,11 @@ class DataParallelPPOActor(BasePPOActor):
         assert self.config.grad_clip is not None
         if self.scaler is not None:
             self.scaler.unscale_(self.actor_optimizer)
+        # Random sparse fine-tuning: only the masked entries train (see src/random_sparse_ft.py).
+        if hasattr(self.actor_module, "mth_grad_masks"):
+            import random_sparse_ft
+
+            random_sparse_ft.mask_gradients(model=self.actor_module)
         if isinstance(self.actor_module, FSDP):
             grad_norm = self.actor_module.clip_grad_norm_(max_norm=self.config.grad_clip)
         elif isinstance(self.actor_module, FSDPModule):

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Evaluate a GRPO Deletion Tuning mask, a full fine-tuned model (global_step_N/actor/huggingface/), or the base model
-# (with "base") on its model's validation benchmarks:
+# Evaluate a GRPO Deletion Tuning mask, a LoRA adapter (global_step_N/actor/lora_adapter/), a full fine-tuned model
+# (global_step_N/actor/huggingface/), or the base model (with "base") on its model's validation benchmarks:
 # GSM8K for Llama, the six SimpleRL-Zoo benchmarks for Qwen. Prints the accuracy per benchmark and their mean.
 #
-# Usage: bash scripts/evaluate_grpo.sh <model> <mask_dir|model_dir|base> <output_dir>
+# Usage: bash scripts/evaluate_grpo.sh <model> <mask_dir|lora_dir|model_dir|base> <output_dir>
 #   model: llama1b | llama3b | llama8b | qwen0.5b | qwen3b | qwen7b | qwen14b | qwen30b_a3b
 # Run from the repository root after scripts/prepare_grpo_data.sh.
 set -euo pipefail
