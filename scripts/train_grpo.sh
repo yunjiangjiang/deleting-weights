@@ -90,6 +90,11 @@ case "${METHOD:-deletion_tuning}" in
   *) echo "METHOD must be deletion_tuning or fft" >&2; exit 1 ;;
 esac
 
+# Optional env override for the HF model path (e.g. ungated mirrors when no HF token).
+if [ -n "${BASE_MODEL_OVERRIDE:-}" ]; then
+  ARGS=("${ARGS[@]/actor_rollout_ref.model.path=*/actor_rollout_ref.model.path=$BASE_MODEL_OVERRIDE}")
+fi
+
 export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
 mkdir -p "$OUT"
 export VERL_FILE_LOGGER_PATH="$OUT/metrics.jsonl"
