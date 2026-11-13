@@ -25,6 +25,9 @@ case "$MODEL" in
   *) echo "unknown model: $MODEL" >&2; exit 1 ;;
 esac
 
+# Optional env override for the HF model path (e.g. ungated mirrors when no HF token).
+BASE=${BASE_MODEL_OVERRIDE:-$BASE}
+
 export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
 python src/evaluate_grpo.py --model_name "$BASE" --checkpoint "$CHECKPOINT" --val_parquets "${VAL[@]}" \
   --output_dir "$OUT" "${ARGS[@]}"
