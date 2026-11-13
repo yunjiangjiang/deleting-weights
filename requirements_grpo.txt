@@ -12,5 +12,7 @@ pandas==2.3.3
 zstandard==0.25.0
 math-verify==0.9.0
 word2number==1.1
+# LoRA Deletion Tuning (mask_type=lora_delete): low-rank mask logits and their Triton kernels
+lora-deletion @ git+https://github.com/yunjiangjiang/lora-deletion-tuning@046201b6365254cbac352ebcdac2330a8bd1a312
 # Forgetting evaluation
 lm-eval[ifeval]==0.4.11

@@ -388,6 +388,9 @@ actor_rollout_ref:
     mask_calib_parquet_files: null
     mask_calib_num_samples: 2048
     mask_calib_max_prompt_length: 512
+    mask_type: dense
+    mask_rank: 32
+    mask_init_std: 0.01
   hybrid_engine: true
   nccl_timeout: 600
 data:
