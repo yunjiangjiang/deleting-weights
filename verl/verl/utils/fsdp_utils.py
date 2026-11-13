@@ -619,12 +619,17 @@ def layered_summon_lora_params(fsdp_module) -> OrderedDict:
                 continue
             if fsdp_version(submodule) > 0:
                 with FSDP.summon_full_params(submodule, writeback=False):
-                    sub_lora_params = get_peft_model_state_dict(peft_model, state_dict=submodule.state_dict())
+                    # peft >= 0.20 looks up full model-prefixed parameter names in state_dict.
+                    prefixed_sd = {
+                        f"{prefix}.{k.removeprefix('_fsdp_wrapped_module.')}": v
+                        for k, v in submodule.state_dict().items()
+                    }
+                    sub_lora_params = get_peft_model_state_dict(peft_model, state_dict=prefixed_sd)
                     sub_lora_params = {
-                        f"{prefix}.{name}": param.full_tensor().detach().cpu()
+                        (k if k.startswith(f"{prefix}.") else f"{prefix}.{k}"): param.full_tensor().detach().cpu()
                         if hasattr(param, "full_tensor")
                         else param.detach().cpu()
-                        for name, param in sub_lora_params.items()
+                        for k, param in sub_lora_params.items()
                     }
                     lora_params.update(sub_lora_params)
                     submodule._is_root = False

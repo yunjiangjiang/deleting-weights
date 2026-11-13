@@ -146,6 +146,8 @@ class HFModelConfig(BaseConfig):
 
     # Deletion Tuning: learn a binary mask over pretrained weights (see src/verl_adapters.py).
     deletion_tuning: bool = False
+    # Random sparse fine-tuning baseline (see src/random_sparse_ft.py).
+    mth_density: float = 0.0
     mask_target_modules: list[str] = field(default_factory=lambda: ["gate_proj"])
     mask_init_sparsity: float = 1.0 / 2048
     mask_prior_strength: float = 3.0

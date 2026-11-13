@@ -99,6 +99,9 @@ mtp:
 # Deletion Tuning: learn a binary mask over pretrained weights (see src/verl_adapters.py).
 deletion_tuning: false
 
+# Random sparse fine-tuning baseline (MTH, see src/random_sparse_ft.py): fraction of every parameter that trains; 0 off.
+mth_density: 0.0
+
 # Name substrings of the linear layers whose weights get a learnable mask.
 mask_target_modules: [gate_proj]
 

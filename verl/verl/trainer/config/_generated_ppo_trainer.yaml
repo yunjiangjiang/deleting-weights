@@ -378,6 +378,7 @@ actor_rollout_ref:
       method: mtp
       num_speculative_tokens: 1
     deletion_tuning: false
+    mth_density: 0.0
     mask_target_modules:
     - gate_proj
     mask_init_sparsity: 0.00048828125

@@ -656,6 +656,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         log_gpu_memory_usage(f"After {role} FSDP init", logger=logger)
 
+        if role == "actor" and self.config.model.mth_density > 0:
+            import random_sparse_ft
+
+            # Seeded like the Deletion Tuning init noise (MASK_INIT_SEED, default 0).
+            random_sparse_ft.apply_random_sparse_ft(
+                actor_module_fsdp, density=self.config.model.mth_density, seed=int(os.environ.get("MASK_INIT_SEED", 0))
+            )
+
         # TODO: add more optimizer args into config
         if role == "actor" and optim_config is not None:
             from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup

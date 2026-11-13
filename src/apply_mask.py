@@ -74,15 +74,34 @@ def save_masked_model(base_model: str, mask_dir: str, output_dir: str) -> int:
     return deleted
 
 
+def is_lora_adapter(path: str) -> bool:
+    """Return whether a directory holds a PEFT LoRA adapter (adapter_config.json)."""
+    return os.path.isfile(os.path.join(path, "adapter_config.json"))
+
+
+def save_merged_lora(base_model: str, adapter_dir: str, output_dir: str) -> None:
+    """Merge a PEFT LoRA adapter into the base model in bf16 and save the merged model with its tokenizer."""
+    from peft import PeftModel
+
+    model = transformers.AutoModelForCausalLM.from_pretrained(base_model, torch_dtype=torch.bfloat16)
+    model = PeftModel.from_pretrained(model, adapter_dir).merge_and_unload()
+    model.save_pretrained(output_dir)
+    transformers.AutoTokenizer.from_pretrained(base_model).save_pretrained(output_dir)
+
+
 @contextlib.contextmanager
 def model_path(base_model: str, checkpoint: str) -> Iterator[str]:
-    """Yield a loadable model path for a checkpoint: a mask directory, a model directory, or "base".
+    """Yield a loadable model path for a checkpoint: a mask directory, a LoRA adapter, a model directory, or "base".
 
-    "base" yields the base model and a model directory yields itself; a mask yields the masked base model, saved in
-    bf16 to a temporary directory that is removed afterwards.
+    "base" yields the base model and a model directory yields itself; a mask or LoRA adapter yields the merged base
+    model, saved in bf16 to a temporary directory that is removed afterwards.
     """
     if checkpoint == "base":
         yield base_model
+    elif is_lora_adapter(path=checkpoint):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            save_merged_lora(base_model=base_model, adapter_dir=checkpoint, output_dir=tmp_dir)
+            yield tmp_dir
     elif not is_mask(path=checkpoint):
         yield checkpoint
     else:
