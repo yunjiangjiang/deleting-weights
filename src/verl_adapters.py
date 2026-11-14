@@ -23,6 +23,7 @@ This module connects the method to verl:
 
 import math
 import os
+import time
 from typing import Iterator
 
 import pandas as pd
@@ -30,11 +31,13 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from omegaconf import DictConfig
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from transformers import AutoTokenizer
 
 import wanda_calibration
 from learnable_sparsity import sparse_linear
 from learnable_sparsity.lora_delete_linear import LoRADeleteSparseLinear, convert_to_lora_delete_model
+from learnable_sparsity.moe_lora_delete import patch_qwen3_moe_sparse_block
 from learnable_sparsity.sparse_linear import SparseLinear
 from lora_deletion.lowrank import lowrank_logits
 
@@ -78,6 +81,44 @@ def _wanda_scores(
     return {k: v.cpu() for k, v in scores.items()}, {k: v.cpu() for k, v in norms.items()}
 
 
+def _wanda_thresholds(
+    model: nn.Module, model_config: DictConfig,
+) -> tuple[dict[str, float], dict[str, torch.Tensor]]:
+    """Stream-capable Wanda calibration returning per-layer thresholds and CPU column norms."""
+    df = pd.concat([pd.read_parquet(f) for f in model_config.mask_calib_parquet_files], ignore_index=True)
+    if len(df) > model_config.mask_calib_num_samples:
+        df = df.sample(n=model_config.mask_calib_num_samples, random_state=42).reset_index(drop=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_config.path, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    texts = [tokenizer.apply_chat_template(list(m), tokenize=False, add_generation_prompt=True) for m in df["prompt"]]
+    max_length = model_config.mask_calib_max_prompt_length
+    enc = tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=max_length)
+    batch_size = 32 if max_length <= 1024 else 8
+    batches = [{k: enc[k][i:i + batch_size] for k in ("input_ids", "attention_mask")}
+               for i in range(0, len(texts), batch_size)]
+
+    orig_dtype = next(model.parameters()).dtype
+    run_dtype = torch.bfloat16 if orig_dtype == torch.float32 else orig_dtype
+    if orig_dtype != run_dtype:
+        model.to(dtype=run_dtype)
+    calib_device = (
+        torch.device(f"cuda:{int(os.environ.get('LOCAL_RANK', '0'))}")
+        if torch.cuda.is_available()
+        else next(model.parameters()).device
+    )
+    print(f"[Deletion Tuning] Wanda calibration (stream-capable) on {len(texts)} prompts, max_length={max_length}, "
+          f"batch_size={batch_size}")
+    try:
+        return wanda_calibration.compute_wanda_thresholds_and_norms(
+            model=model, dataloader=batches, device=calib_device, num_samples=len(texts),
+            target_modules=list(model_config.mask_target_modules), init_sparsity=model_config.mask_init_sparsity,
+        )
+    finally:
+        if orig_dtype != run_dtype:
+            model.to(dtype=orig_dtype)
+
+
 def _init_lora_delete_from_wanda(
     model: nn.Module, wanda_scores: dict[str, torch.Tensor], activation_norms: dict[str, torch.Tensor],
     init_sparsity: float,
@@ -102,15 +143,46 @@ def apply_deletion_tuning(model: nn.Module, model_config: DictConfig) -> nn.Modu
     ``model_config.mask_type`` is ``dense`` (one logit per weight) or ``lora_delete`` (G0 + H logits with
     ``mask_rank``).
     """
+    patch_qwen3_moe_sparse_block()
     model.enable_input_require_grads()
     prior_strength = model_config.mask_prior_strength
     assert prior_strength == 0 or model_config.mask_calib_parquet_files is not None, (
         "mask_prior_strength > 0 needs mask_calib_parquet_files (the training parquets) to calibrate the Wanda prior"
     )
+    orig_dtype = next(model.parameters()).dtype
+    run_dtype = torch.bfloat16 if orig_dtype == torch.float32 else orig_dtype
+    calib_device = (
+        torch.device(f"cuda:{int(os.environ.get('LOCAL_RANK', '0'))}")
+        if torch.cuda.is_available()
+        else next(model.parameters()).device
+    )
     # Only rank 0 holds the pretrained weights here; FSDP broadcasts its initialized logits to the other ranks.
     calibrate = prior_strength > 0 and dist.get_rank() == 0
     if calibrate:
-        wanda_scores, activation_norms = _wanda_scores(model=model, model_config=model_config)
+        t_wanda = time.time()
+        wcache = os.environ.get("WANDA_CACHE_PATH", "")
+        loaded_cache = False
+        if wcache and os.path.exists(wcache):
+            obj = torch.load(wcache, map_location="cpu", weights_only=False)
+            if obj.get("init_sparsity", model_config.mask_init_sparsity) == model_config.mask_init_sparsity:
+                wanda_thresholds, activation_norms = obj["thresholds"], obj["norms"]
+                loaded_cache = True
+                print(f"[Deletion Tuning] Loaded cached Wanda thresholds from {wcache}")
+        if not loaded_cache:
+            wanda_thresholds, activation_norms = _wanda_thresholds(model=model, model_config=model_config)
+            if wcache:
+                os.makedirs(os.path.dirname(os.path.abspath(wcache)), exist_ok=True)
+                torch.save(
+                    {
+                        "thresholds": wanda_thresholds,
+                        "norms": activation_norms,
+                        "init_sparsity": float(model_config.mask_init_sparsity),
+                    },
+                    wcache,
+                )
+                print(f"[Deletion Tuning] Saved Wanda thresholds cache to {wcache}")
+        print(f"[Deletion Tuning] Wanda calibration finished in {time.time() - t_wanda:.2f}s "
+              f"({len(activation_norms)} target layers calibrated)")
 
     sharpness = [model_config.mask_sharpness_start, model_config.mask_sharpness_end]
     # Optional run-level seed for the gate noise init; unset keeps the paper's default behavior.
@@ -124,9 +196,13 @@ def apply_deletion_tuning(model: nn.Module, model_config: DictConfig) -> nn.Modu
             model=model, target_modules=target_modules, sharpness=sharpness, total_steps=1,
         )
         if calibrate:
-            wanda_calibration.init_masks_from_wanda(
-                model=model, wanda_scores=wanda_scores, init_sparsity=model_config.mask_init_sparsity,
+            wanda_calibration.init_masks_from_wanda_thresholds(
+                model=model,
+                thresholds=wanda_thresholds,
+                activation_norms=activation_norms,
                 prior_strength=prior_strength,
+                score_device=calib_device,
+                score_weight_dtype=run_dtype,
             )
     elif model_config.mask_type == "lora_delete":
         convert_to_lora_delete_model(
@@ -135,10 +211,11 @@ def apply_deletion_tuning(model: nn.Module, model_config: DictConfig) -> nn.Modu
             init_std=model_config.mask_init_std,
         )
         if calibrate:
-            _init_lora_delete_from_wanda(
-                model=model, wanda_scores=wanda_scores, activation_norms=activation_norms,
-                init_sparsity=model_config.mask_init_sparsity,
-            )
+            for name, mod in model.named_modules():
+                if isinstance(mod, LoRADeleteSparseLinear) and name in wanda_thresholds:
+                    with torch.no_grad():
+                        mod.col_norm.copy_(activation_norms[name])
+                        mod.threshold.fill_(wanda_thresholds[name])
     else:
         raise ValueError(f"mask_type must be dense or lora_delete, got {model_config.mask_type!r}")
 
@@ -334,12 +411,134 @@ def _iter_full_hard_masks(
         yield from _yield_bucket(bucket)
 
 
+def _clean_fsdp_name(name: str) -> str:
+    return ".".join(p for p in name.split(".") if p and p != "_fsdp_wrapped_module")
+
+
+def _top_level_fsdp_children(module: nn.Module, prefix: str = "") -> list[tuple[str, FSDP]]:
+    out: list[tuple[str, FSDP]] = []
+    unwrapped = getattr(module, "_fsdp_wrapped_module", module)
+    for child_name, child in unwrapped.named_children():
+        child_prefix = f"{prefix}.{child_name}" if prefix else child_name
+        if isinstance(child, FSDP):
+            out.append((child_prefix, child))
+        else:
+            out.extend(_top_level_fsdp_children(child, child_prefix))
+    return out
+
+
+def _direct_non_fsdp_named_params(module: nn.Module, prefix: str = "") -> list[tuple[str, nn.Parameter]]:
+    out: list[tuple[str, nn.Parameter]] = []
+    unwrapped = getattr(module, "_fsdp_wrapped_module", module)
+    for pname, param in unwrapped.named_parameters(recurse=False):
+        full = f"{prefix}.{pname}" if prefix else pname
+        out.append((full, param))
+    for child_name, child in unwrapped.named_children():
+        if isinstance(child, FSDP):
+            continue
+        child_prefix = f"{prefix}.{child_name}" if prefix else child_name
+        out.extend(_direct_non_fsdp_named_params(child, child_prefix))
+    return out
+
+
+@torch.no_grad()
+def _batched_lora_delete_masks(named_mods: list[tuple[str, LoRADeleteSparseLinear]]) -> dict[str, torch.Tensor]:
+    """Compute boolean [d_out, d_in] hard masks for unsharded LoRADeleteSparseLinear modules, batched by shape."""
+    groups: dict[tuple[int, int, int, float], list[tuple[str, LoRADeleteSparseLinear]]] = {}
+    for name, mod in named_mods:
+        key = (mod.out_features, mod.in_features, mod.rank, float(mod.prior))
+        groups.setdefault(key, []).append((name, mod))
+    masks_out: dict[str, torch.Tensor] = {}
+    for (_, _, _, prior), grp in groups.items():
+        dev = grp[0][1].weight.device
+        W_s = torch.stack([m.weight.detach() for _, m in grp], dim=0)
+        B_s = torch.stack([m.mask_B.detach().to(device=dev, dtype=torch.float32) for _, m in grp], dim=0)
+        A_s = torch.stack([m.mask_A.detach().to(device=dev, dtype=torch.float32) for _, m in grp], dim=0)
+        cn_s = torch.stack([m.col_norm.to(device=dev, dtype=torch.float32) for _, m in grp], dim=0)
+        th_s = torch.stack([m.threshold.to(device=dev, dtype=torch.float32) for _, m in grp], dim=0)
+        batch_masks = lowrank_logits(W_s, B_s, A_s, cn_s, th_s, prior) > 0
+        for i, (name, _) in enumerate(grp):
+            masks_out[name] = batch_masks[i]
+    return masks_out
+
+
+@torch.no_grad()
+def _summoned_hard_masks(named_mods: list[tuple[str, nn.Module]]) -> dict[str, torch.Tensor]:
+    """Compute boolean [d_out, d_in] hard masks for unsharded MASKED_LAYERS inside FSDP.summon_full_params."""
+    masks_out: dict[str, torch.Tensor] = {}
+    lora_mods: list[tuple[str, LoRADeleteSparseLinear]] = []
+    for name, mod in named_mods:
+        if isinstance(mod, LoRADeleteSparseLinear):
+            lora_mods.append((name, mod))
+        elif isinstance(mod, SparseLinear):
+            gate = mod.diff_mask.gate
+            local_gate = gate.to_local() if hasattr(gate, "to_local") else gate.detach()
+            masks_out[name] = (local_gate > 0).view(mod.weight.shape)
+    if lora_mods:
+        masks_out.update(_batched_lora_delete_masks(lora_mods))
+    return masks_out
+
+
+def _has_masked_layers(fsdp_module: nn.Module) -> bool:
+    return any(isinstance(mod, MASKED_LAYERS) for mod in fsdp_module.modules())
+
+
+def _has_lora_delete_layers(fsdp_module: nn.Module) -> bool:
+    return any(isinstance(mod, LoRADeleteSparseLinear) for mod in fsdp_module.modules())
+
+
 def collect_merged_params(fsdp_module: nn.Module) -> Iterator[tuple[str, torch.Tensor]]:
     """Yield the Hugging Face state dict for vLLM, with each masked weight replaced by ``weight * hard_mask``.
 
     All ranks must consume the iterator together and in full, since its gathers are collective. Masked weights are
-    built one at a time, as they are consumed.
+    built one at a time (or one FSDP decoder layer at a time under FSDP1), as they are consumed.
     """
+    if isinstance(fsdp_module, FSDP) and _has_masked_layers(fsdp_module):
+        mp_dtype = getattr(getattr(fsdp_module, "mixed_precision", None), "param_dtype", None)
+        # 1. Root non-FSDP parameters (e.g., embed_tokens, norm, lm_head)
+        with FSDP.summon_full_params(fsdp_module, writeback=False, recurse=False):
+            direct_params = dict(_direct_non_fsdp_named_params(fsdp_module))
+            root_masked = [
+                (_clean_fsdp_name(n), m)
+                for n, m in fsdp_module._fsdp_wrapped_module.named_modules()
+                if isinstance(m, MASKED_LAYERS) and f"{_clean_fsdp_name(n)}.weight" in direct_params
+            ]
+            root_masks = _summoned_hard_masks(root_masked) if root_masked else {}
+            for pname, p in direct_params.items():
+                if any(k in pname for k in _MASK_PARAM_NAMES):
+                    continue
+                mod_prefix = pname[:-7] if pname.endswith(".weight") else ""
+                out_dt = mp_dtype or p.dtype
+                if mod_prefix in root_masks:
+                    w = p.detach() * root_masks[mod_prefix].to(dtype=p.dtype, device=p.device)
+                    yield pname, w.to(dtype=out_dt).clone()
+                else:
+                    yield pname, p.detach().to(dtype=out_dt).clone()
+
+        # 2. Each top-level FSDP child unit (e.g., each Qwen3MoeDecoderLayer with all 128 experts)
+        for child_prefix, child_fsdp in _top_level_fsdp_children(fsdp_module):
+            with FSDP.summon_full_params(child_fsdp, writeback=False, recurse=True):
+                layer_masked: list[tuple[str, nn.Module]] = []
+                for rel_name, mod in child_fsdp.named_modules():
+                    if isinstance(mod, MASKED_LAYERS):
+                        clean_rel = _clean_fsdp_name(rel_name)
+                        full_mod_name = f"{child_prefix}.{clean_rel}" if clean_rel else child_prefix
+                        layer_masked.append((full_mod_name, mod))
+                layer_masks = _summoned_hard_masks(layer_masked) if layer_masked else {}
+                for rel_pname, p in child_fsdp.named_parameters():
+                    clean_rel_p = _clean_fsdp_name(rel_pname)
+                    full_pname = f"{child_prefix}.{clean_rel_p}" if clean_rel_p else child_prefix
+                    if any(k in full_pname for k in _MASK_PARAM_NAMES):
+                        continue
+                    mod_prefix = full_pname[:-7] if full_pname.endswith(".weight") else ""
+                    out_dt = mp_dtype or p.dtype
+                    if mod_prefix in layer_masks:
+                        w = p.detach() * layer_masks[mod_prefix].to(dtype=p.dtype, device=p.device)
+                        yield full_pname, w.to(dtype=out_dt).clone()
+                    else:
+                        yield full_pname, p.detach().to(dtype=out_dt).clone()
+        return
+
     model = getattr(fsdp_module, "_fsdp_wrapped_module", fsdp_module)
     sparse_modules = {name.replace("_fsdp_wrapped_module.", ""): mod
                       for name, mod in model.named_modules() if isinstance(mod, MASKED_LAYERS)}
@@ -361,6 +560,37 @@ def collect_merged_params(fsdp_module: nn.Module) -> Iterator[tuple[str, torch.T
 def save_mask_checkpoint(fsdp_module: nn.Module, save_dir: str) -> None:
     """Save the hard mask to ``save_dir/mask/``; every rank must call this, and rank 0 writes the files."""
     rank = dist.get_rank()
+    if isinstance(fsdp_module, FSDP) and _has_lora_delete_layers(fsdp_module):
+        mask_dict: dict[str, torch.Tensor] = {}
+        with FSDP.summon_full_params(fsdp_module, writeback=False, recurse=False):
+            direct_params = dict(_direct_non_fsdp_named_params(fsdp_module))
+            root_masked = [
+                (_clean_fsdp_name(n), m)
+                for n, m in fsdp_module._fsdp_wrapped_module.named_modules()
+                if isinstance(m, MASKED_LAYERS) and f"{_clean_fsdp_name(n)}.weight" in direct_params
+            ]
+            if root_masked:
+                for mname, mval in _summoned_hard_masks(root_masked).items():
+                    if rank == 0:
+                        mask_dict[f"{mname}.weight"] = mval.cpu()
+        for child_prefix, child_fsdp in _top_level_fsdp_children(fsdp_module):
+            with FSDP.summon_full_params(child_fsdp, writeback=False, recurse=True):
+                layer_masked = []
+                for rel_name, mod in child_fsdp.named_modules():
+                    if isinstance(mod, MASKED_LAYERS):
+                        clean_rel = _clean_fsdp_name(rel_name)
+                        full_mod_name = f"{child_prefix}.{clean_rel}" if clean_rel else child_prefix
+                        layer_masked.append((full_mod_name, mod))
+                if layer_masked:
+                    for mname, mval in _summoned_hard_masks(layer_masked).items():
+                        if rank == 0:
+                            mask_dict[f"{mname}.weight"] = mval.cpu()
+        if rank == 0:
+            mask_save_dir = os.path.join(save_dir, "mask")
+            sparse_linear.save_mask(mask=mask_dict, save_path=mask_save_dir)
+            print(f"[Deletion Tuning] saved mask to {mask_save_dir}")
+        return
+
     model = getattr(fsdp_module, "_fsdp_wrapped_module", fsdp_module)
     named = [(name.replace("_fsdp_wrapped_module.", ""), mod) for name, mod in model.named_modules()
              if isinstance(mod, MASKED_LAYERS)]
@@ -369,7 +599,7 @@ def save_mask_checkpoint(fsdp_module: nn.Module, save_dir: str) -> None:
         if any(isinstance(mod, LoRADeleteSparseLinear) for _, mod in named)
         else None
     )
-    mask_dict: dict[str, torch.Tensor] = {}
+    mask_dict = {}
     for clean, _, full_mask in _iter_full_hard_masks(named, raw_sd=raw_sd):
         if rank == 0:
             mask_dict[f"{clean}.weight"] = full_mask.cpu()

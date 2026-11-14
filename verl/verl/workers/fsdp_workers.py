@@ -507,6 +507,18 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             if enable_gradient_checkpointing:
                 actor_module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
+        try:
+            from learnable_sparsity.moe_lora_delete import patch_qwen3_moe_sparse_block
+        except ImportError:
+            import sys as _sys
+
+            _src_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "src"))
+            if _src_dir not in _sys.path:
+                _sys.path.insert(0, _src_dir)
+            from learnable_sparsity.moe_lora_delete import patch_qwen3_moe_sparse_block
+
+        patch_qwen3_moe_sparse_block()
+
         if self._is_lora:
             print("Applying LoRA to actor module")
             actor_module.enable_input_require_grads()
@@ -635,7 +647,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 self._is_offload_param = False
                 self._is_offload_optimizer = False
             else:
-                cpu_offload = None if role == "actor" else CPUOffloadPolicy(pin_memory=True)
+                cpu_offload = None if role == "actor" else CPUOffloadPolicy(pin_memory=False)
 
             fsdp_kwargs = {
                 "mesh": fsdp_mesh,
@@ -644,9 +656,21 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 "reshard_after_forward": fsdp_config.reshard_after_forward,
                 "shard_placement_fn": get_shard_placement_fn(fsdp_size=self.device_mesh.shape[-1]),
             }
-            full_state = actor_module.state_dict()
+            full_state = {k: v.detach() for k, v in actor_module.state_dict().items()} if self.rank == 0 else {}
+            orig_buffers = {k: v.detach().clone() for k, v in actor_module.named_buffers()} if self.rank == 0 else {}
+            if self.rank == 0:
+                actor_module = actor_module.to("meta")
             apply_fsdp2(actor_module, fsdp_kwargs, fsdp_config)
-            fsdp2_load_full_state_dict(actor_module, full_state, fsdp_mesh, cpu_offload)
+            fsdp2_load_full_state_dict(actor_module, full_state, fsdp_mesh, cpu_offload, orig_buffers=orig_buffers)
+            del full_state, orig_buffers
+            import ctypes
+            import gc
+
+            gc.collect()
+            try:
+                ctypes.CDLL("libc.so.6").malloc_trim(0)
+            except Exception:
+                pass
             actor_module_fsdp = actor_module
         else:
             raise NotImplementedError(f"not implement {fsdp_strategy}")
