@@ -43,7 +43,11 @@ def default_compute_score(
     Raises:
         NotImplementedError: If the reward function is not implemented for the given data source.
     """
-    if data_source.startswith("simplerl_zoo_"):
+    if data_source.startswith("countdown"):
+        from . import countdown_reward
+
+        res = countdown_reward.compute_score(solution_str, ground_truth)
+    elif data_source.startswith("simplerl_zoo_"):
         from . import simplerl_zoo_reward
 
         res = simplerl_zoo_reward.compute_score(solution_str, ground_truth)
