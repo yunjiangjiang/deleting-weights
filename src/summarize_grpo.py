@@ -13,6 +13,7 @@ import sys
 
 DATA_SOURCES = {
     "gsm8k": ["openai/gsm8k"],
+    "countdown_5": ["countdown_5"],
     "simplerl_zoo": [f"simplerl_zoo_{b}" for b in ["gsm8k", "math500", "minerva", "olympiadbench", "aime24", "amc23"]],
 }
 
