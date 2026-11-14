@@ -119,3 +119,146 @@ def init_masks_from_wanda(
         deletions=wanda_prior_deletions(model=model, wanda_scores=wanda_scores, init_sparsity=init_sparsity),
         prior_strength=prior_strength,
     )
+
+
+def _find_decoder_layers(model: nn.Module) -> nn.ModuleList | None:
+    """Return the main transformer decoder ModuleList (e.g. model.model.layers), if present."""
+    for name, mod in model.named_modules():
+        if isinstance(mod, nn.ModuleList) and name.endswith("layers") and len(mod) >= 2:
+            return mod
+    return None
+
+
+def compute_wanda_thresholds_and_norms(
+    model: nn.Module,
+    dataloader: Iterable[dict[str, torch.Tensor]],
+    device: torch.device,
+    num_samples: int,
+    target_modules: list[str],
+    init_sparsity: float,
+    max_gpu_fraction: float = 0.72,
+) -> tuple[dict[str, float], dict[str, torch.Tensor]]:
+    """Stream-capable Wanda calibration returning ``(thresholds, activation_norms_cpu)`` with O(1) extra GPU memory.
+
+    When ``model`` exceeds ``max_gpu_fraction`` of free memory on ``device`` (e.g. 235B bf16 = 470 GB on a single
+    288 GB GPU), early decoder layers stay resident on ``device`` while overflow decoder layers stream CPU -> GPU -> CPU
+    per forward pass, and per-layer kthvalue thresholds are computed one layer at a time on ``device`` without
+    materializing a 300+ GB float32 ``scores`` dictionary. Passing ``max_gpu_fraction <= 0.0`` forces layer-by-layer
+    streaming (useful for testing).
+    """
+    orig_device = next(model.parameters()).device
+    param_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
+    free_bytes = torch.cuda.mem_get_info(device)[0] if device.type == "cuda" else 0
+    force_stream = max_gpu_fraction <= 0.0
+    offload_hooks = []
+
+    if not force_stream and (device.type != "cuda" or param_bytes <= int(max_gpu_fraction * free_bytes)):
+        model.to(device=device)
+    else:
+        layers = _find_decoder_layers(model)
+        assert layers is not None, "Model exceeds single-GPU memory but has no decoder ModuleList to stream"
+        # Move non-decoder-layer direct parameters/buffers (embed_tokens, rotary_emb, final norm, lm_head) to device.
+        layer_param_ids = {id(p) for layer in layers for p in layer.parameters()}
+        layer_buf_ids = {id(b) for layer in layers for b in layer.buffers()}
+        for sub in model.modules():
+            for p in sub.parameters(recurse=False):
+                if id(p) not in layer_param_ids:
+                    p.data = p.data.to(device)
+            for b in sub.buffers(recurse=False):
+                if id(b) not in layer_buf_ids:
+                    b.data = b.data.to(device)
+        budget = 0 if force_stream else int(max_gpu_fraction * torch.cuda.mem_get_info(device)[0])
+        used = 0
+        resident_count = 0
+        for layer in layers:
+            lbytes = sum(p.numel() * p.element_size() for p in layer.parameters()) + sum(
+                b.numel() * b.element_size() for b in layer.buffers()
+            )
+            if not force_stream and used + lbytes <= budget:
+                layer.to(device)
+                used += lbytes
+                resident_count += 1
+            else:
+                layer.to("cpu")
+                offload_hooks.append(layer.register_forward_pre_hook(lambda mod, _inp: (mod.to(device), None)[1]))
+                offload_hooks.append(layer.register_forward_hook(lambda mod, _inp, _out: (mod.to("cpu"), None)[1]))
+        print(
+            f"[Deletion Tuning] Streamed Wanda placement: {resident_count}/{len(layers)} decoder layers resident on "
+            f"{device} ({used / 1e9:.1f} GB), {len(layers) - resident_count} layers streamed from CPU"
+        )
+
+    model.eval()
+    sparse_layers = [m for m in model.modules() if isinstance(m, _MASKED_LAYERS)]
+    for m in sparse_layers:
+        m.sparse = False
+    activation_norms: dict[str, torch.Tensor] = {}
+    hooks = []
+    for name, module in model.named_modules():
+        if isinstance(module, (nn.Linear, *_MASKED_LAYERS)) and any(t in name for t in target_modules):
+            def _hook(mod, inp, _out, name=name):
+                x = inp[0].detach()
+                norm = x.float().pow(2).sum(dim=tuple(range(x.dim() - 1))).sqrt()
+                if name in activation_norms:
+                    activation_norms[name] += norm
+                else:
+                    activation_norms[name] = norm
+            hooks.append(module.register_forward_hook(_hook))
+
+    samples_seen = 0
+    with torch.no_grad():
+        for batch in dataloader:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            model(input_ids=input_ids, attention_mask=attention_mask)
+            samples_seen += input_ids.shape[0]
+            if samples_seen >= num_samples:
+                break
+
+    for h in hooks + offload_hooks:
+        h.remove()
+    for m in sparse_layers:
+        m.sparse = True
+
+    thresholds: dict[str, float] = {}
+    norms_cpu: dict[str, torch.Tensor] = {}
+    with torch.no_grad():
+        for name, module in model.named_modules():
+            if isinstance(module, (nn.Linear, *_MASKED_LAYERS)) and name in activation_norms:
+                norm_dev = activation_norms[name].to(device=device, dtype=torch.float32)
+                W = module.weight.data.to(device=device, dtype=torch.float32).abs()
+                scores_layer = W * norm_dev.unsqueeze(0)
+                thresholds[name] = wanda_threshold(scores=scores_layer, init_sparsity=init_sparsity)
+                norms_cpu[name] = norm_dev.cpu()
+                del W, scores_layer
+    activation_norms.clear()
+    model.to(device=orig_device)
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    return thresholds, norms_cpu
+
+
+def init_masks_from_wanda_thresholds(
+    model: nn.Module,
+    thresholds: dict[str, float],
+    activation_norms: dict[str, torch.Tensor],
+    prior_strength: float,
+    score_device: torch.device | None = None,
+    score_weight_dtype: torch.dtype | None = None,
+) -> None:
+    """Apply the Wanda prior to every SparseLinear one layer at a time without materializing full wanda_scores."""
+    for name, module in model.named_modules():
+        if not isinstance(module, SparseLinear) or name not in thresholds:
+            continue
+        with torch.no_grad():
+            dev = score_device if score_device is not None else module.weight.device
+            w_src = module.weight.data
+            if score_weight_dtype is not None and w_src.dtype != score_weight_dtype:
+                w_src = w_src.to(device=dev, dtype=score_weight_dtype)
+            W = w_src.to(device=dev, dtype=torch.float32).abs()
+            norm = activation_norms[name].to(device=dev, dtype=torch.float32)
+            del_mask = (W * norm.unsqueeze(0)).view(-1) < thresholds[name]
+            gate = module.diff_mask.gate
+            prior_sign = torch.where(del_mask.to(gate.device), -1.0, 1.0)
+            gate_std = gate.std().item()
+            gate.data += (prior_sign * gate_std * prior_strength).to(gate.dtype)
+            del W, norm, del_mask, prior_sign

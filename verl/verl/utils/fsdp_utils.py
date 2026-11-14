@@ -451,7 +451,9 @@ def get_fsdp_full_state_dict(model: torch.nn.Module, offload_to_cpu: bool = True
         raise NotImplementedError(f"Unknown FSDP version {fsdp_version}")
 
 
-def fsdp2_load_full_state_dict(model: torch.nn.Module, full_state: dict, device_mesh=None, cpu_offload=None):
+def fsdp2_load_full_state_dict(
+    model: torch.nn.Module, full_state: dict, device_mesh=None, cpu_offload=None, orig_buffers=None
+):
     """
     Loads the full state dict (could be only on rank 0) into the sharded model. This is done by broadcasting the
     parameters from rank 0 to all other ranks. This function modifies the model in-place.
@@ -468,11 +470,15 @@ def fsdp2_load_full_state_dict(model: torch.nn.Module, full_state: dict, device_
         # use torch 2.7.0 copy from verl/third_party/torch/distributed/checkpoint
         from verl.third_party.torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
 
-    # To broadcast, it needs to be instantiated in the GPU.
-    if dist.get_rank() == 0:
+    # Instantiate sharded parameters/buffers directly on GPU across all ranks (avoids >1-GPU OOM on rank 0).
+    if dist.get_rank() == 0 and not any(p.is_meta for p in model.parameters()):
         model = model.to(device=get_device_id(), non_blocking=True)
     else:
         model = model.to_empty(device=get_device_id())
+        if dist.get_rank() == 0 and orig_buffers:
+            for _bname, _buf in model.named_buffers():
+                if _bname in orig_buffers:
+                    _buf.data.copy_(orig_buffers[_bname].to(device=_buf.device, dtype=_buf.dtype))
 
     cpu_offload = cpu_offload is not None
     options = StateDictOptions(full_state_dict=True, cpu_offload=cpu_offload, broadcast_from_rank0=True)
@@ -583,6 +589,9 @@ def fsdp2_clip_grad_norm_(parameters, max_norm, norm_type=2.0, error_if_nonfinit
     else:
         # prevent generators from being exhausted
         parameters = list(parameters)
+    for _p in parameters:
+        if _p.requires_grad and _p.grad is None:
+            _p.grad = torch.zeros_like(_p)
     grads = [p.grad for p in parameters if p.grad is not None]
     total_norm = _get_total_norm(grads, norm_type, error_if_nonfinite, foreach)
     total_norm = total_norm.to(get_device_id(), non_blocking=True)
