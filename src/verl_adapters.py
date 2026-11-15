@@ -1,3 +1,4 @@
+import gc
 """Deletion Tuning inside verl's GRPO trainer.
 
 Deletion Tuning learns which pretrained weights to set to zero. Every weight of each target
@@ -549,12 +550,18 @@ def collect_merged_params(fsdp_module: nn.Module) -> Iterator[tuple[str, torch.T
         if not any(".".join(parts[:i]) in sparse_modules for i in range(1, len(parts) + 1)):
             yield ckey, val.detach()
 
-    for name, _, full_mask in _iter_full_hard_masks(list(sparse_modules.items()), raw_sd=raw_sd):
-        with torch.no_grad():
-            weight = raw_sd[f"{name}.weight"]
-            if hasattr(weight, "full_tensor"):
-                weight = weight.full_tensor()
-            yield f"{name}.weight", weight.detach() * full_mask.to(dtype=weight.dtype, device=weight.device)
+    try:
+        for name, _, full_mask in _iter_full_hard_masks(list(sparse_modules.items()), raw_sd=raw_sd):
+            with torch.no_grad():
+                weight = raw_sd[f"{name}.weight"]
+                if hasattr(weight, "full_tensor"):
+                    weight = weight.full_tensor()
+                yield f"{name}.weight", weight.detach() * full_mask.to(dtype=weight.dtype, device=weight.device)
+    finally:
+        raw_sd.clear()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 def save_mask_checkpoint(fsdp_module: nn.Module, save_dir: str) -> None:
@@ -599,12 +606,22 @@ def save_mask_checkpoint(fsdp_module: nn.Module, save_dir: str) -> None:
         if any(isinstance(mod, LoRADeleteSparseLinear) for _, mod in named)
         else None
     )
-    mask_dict = {}
-    for clean, _, full_mask in _iter_full_hard_masks(named, raw_sd=raw_sd):
+    try:
         if rank == 0:
-            mask_dict[f"{clean}.weight"] = full_mask.cpu()
-    if rank == 0:
-        mask_save_dir = os.path.join(save_dir, "mask")
-        sparse_linear.save_mask(mask=mask_dict, save_path=mask_save_dir)
-        print(f"[Deletion Tuning] saved mask to {mask_save_dir}")
+            def _stream_masks():
+                for clean, _, full_mask in _iter_full_hard_masks(named, raw_sd=raw_sd):
+                    yield f"{clean}.weight", full_mask.cpu()
+
+            mask_save_dir = os.path.join(save_dir, "mask")
+            sparse_linear.save_mask(mask=_stream_masks(), save_path=mask_save_dir)
+            print(f"[Deletion Tuning] saved mask to {mask_save_dir}")
+        else:
+            for _ in _iter_full_hard_masks(named, raw_sd=raw_sd):
+                pass
+    finally:
+        if raw_sd is not None:
+            raw_sd.clear()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 

@@ -30,7 +30,8 @@ class DifferentiableMask(nn.Module):
         self.total_steps = total_steps
         self.current_step = 0
         self.gate = Parameter(torch.empty(target_param.numel(), dtype=torch.float32, device=target_device))
-        init.normal_(self.gate, std=0.01)
+        if not self.gate.is_meta:
+            init.normal_(self.gate, std=0.01)
         # Current sharpness, updated by every training-mode forward.
         self.current_sharpness = sharpness[0]
 
