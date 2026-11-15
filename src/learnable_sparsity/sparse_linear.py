@@ -47,6 +47,7 @@ class SparseLinear(nn.Module):
         device: torch.device,
         dtype: torch.dtype,
         target_device: torch.device,
+        weight: torch.Tensor | None = None,
     ):
         """Create the weight (filled in by convert_to_sparse_model) and its mask logits."""
         super().__init__()
@@ -59,8 +60,12 @@ class SparseLinear(nn.Module):
         self.step_weight = None
         self._step_sharpness = None  # sharpness the step weight was built at
         self._gate_guard = None  # hook that rejects logit gradients bypassing the step weight
-        self.weight = Parameter(torch.empty((out_features, in_features), device=device, dtype=dtype))
-        nn.init.kaiming_uniform_(self.weight, a=5**0.5)
+        if weight is not None:
+            self.weight = Parameter(weight.data, requires_grad=False)
+        else:
+            self.weight = Parameter(torch.empty((out_features, in_features), device=device, dtype=dtype))
+            if not self.weight.is_meta:
+                nn.init.kaiming_uniform_(self.weight, a=5**0.5)
         self.diff_mask = DifferentiableMask(
             target_param=self.weight,
             sharpness=sharpness,
@@ -174,6 +179,8 @@ def convert_to_sparse_model(
         for child_name, child_module in module.named_children():
             full_name = f"{name}.{child_name}" if name else child_name
             if isinstance(child_module, nn.Linear) and any(target in full_name for target in target_modules):
+                if child_module.bias is not None:
+                    warnings.warn(f"convert_to_sparse_model: {full_name} has a bias, which SparseLinear drops.")
                 sparse_layer = SparseLinear(
                     in_features=child_module.in_features,
                     out_features=child_module.out_features,
@@ -182,11 +189,8 @@ def convert_to_sparse_model(
                     device=child_module.weight.device,
                     dtype=child_module.weight.dtype,
                     target_device=target_device,
+                    weight=child_module.weight,
                 )
-                if child_module.bias is not None:
-                    warnings.warn(f"convert_to_sparse_model: {full_name} has a bias, which SparseLinear drops.")
-                with torch.no_grad():
-                    sparse_layer.weight.data.copy_(child_module.weight.data)
                 setattr(module, child_name, sparse_layer)
                 converted_count += 1
             else:
@@ -224,7 +228,8 @@ def compress_mask(mask_dict: dict[str, torch.Tensor]) -> tuple[dict[str, torch.T
         "compressed_size_mb": 0,
     }
     cctx = zstd.ZstdCompressor(level=3)
-    for name, mask in mask_dict.items():
+    items = mask_dict.items() if isinstance(mask_dict, dict) else mask_dict
+    for name, mask in items:
         mask_bool = mask.to(torch.bool).cpu()
         packed = np.packbits(mask_bool.numpy().ravel())
         zstd_bytes = cctx.compress(packed.tobytes())
